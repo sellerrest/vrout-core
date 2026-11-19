@@ -1,0 +1,83 @@
+name: Build official mihomo for vrout
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '22 */6 * * *'
+
+concurrency:
+  group: vrout-core-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PATCH_REVISION: '1'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Find latest stable mihomo
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(gh api repos/MetaCubeX/mihomo/releases/latest --jq '.tag_name')"
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag="$version-vrout.$PATCH_REVISION"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: Patch, test and build
+        if: steps.upstream.outputs.build == 'true'
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir mihomo dist
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://codeload.github.com/MetaCubeX/mihomo/tar.gz/refs/tags/$UPSTREAM" \
+            | tar -xz -C mihomo --strip-components=1
+          git init -q mihomo
+          git -C mihomo apply --check "$PWD/vrout.patch"
+          git -C mihomo apply "$PWD/vrout.patch"
+          (
+            cd mihomo
+            go test -tags with_gvisor ./config ./dns ./rules/...
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags with_gvisor \
+              -trimpath -ldflags="-X github.com/metacubex/mihomo/constant.Version=$UPSTREAM -s -w -buildid=" \
+              -o "$PWD/../dist/mihomo-windows-x64.exe" .
+          )
+          tar --exclude=mihomo/.git -czf "dist/mihomo-$UPSTREAM-vrout-source.tar.gz" mihomo
+          cp vrout.patch dist/
+      - name: Publish Windows build and source
+        if: steps.upstream.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "mihomo $TAG" --latest \
+            --notes "Official mihomo $UPSTREAM with the vrout DNS and startup patch."

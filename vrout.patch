@@ -1,0 +1,150 @@
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -271,6 +271,7 @@
+ 		FakeIPPool6:   c.FakeIPPool6,
+ 		FakeIPSkipper: c.FakeIPSkipper,
+ 		FakeIPTTL:     c.FakeIPTTL,
++		FakeIPLookup:  c.FakeIPLookup,
+ 		UseHosts:      c.UseHosts,
+ 	})
+ 
+--- a/hub/hub.go
++++ b/hub/hub.go
+@@ -53,8 +53,8 @@
+ 
+ // ApplyConfig dispatch configure to all parts include ExternalController
+ func ApplyConfig(cfg *config.Config) {
++	executor.ApplyConfig(cfg, true)
+ 	applyRoute(cfg)
+-	executor.ApplyConfig(cfg, true)
+ }
+ 
+ func applyRoute(cfg *config.Config) {
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -218,6 +218,15 @@
+ 
+ 		if matched := r.matchPolicy(m); len(matched) != 0 {
+ 			result, cache, err = batchExchange(ctx, matched, m)
++			return
++		}
++		if r.fallbackLazyQuery && len(r.fallback) != 0 {
++			primary, cancelPrimary := context.WithTimeout(ctx, resolver.DefaultDNSTimeout/2)
++			result, cache, err = batchExchange(primary, r.main, m)
++			cancelPrimary()
++			if err != nil {
++				result, cache, err = batchExchange(ctx, r.fallback, m)
++			}
+ 			return
+ 		}
+ 		result, cache, err = batchExchange(ctx, r.main, m)
+@@ -313,7 +322,13 @@
+ 		return res.Msg, res.Error
+ 	}
+ 
+-	msgCh := r.asyncExchange(ctx, r.main, m)
++	primary := ctx
++	if r.fallbackLazyQuery && len(r.fallback) != 0 {
++		var cancelPrimary context.CancelFunc
++		primary, cancelPrimary = context.WithTimeout(ctx, resolver.DefaultDNSTimeout/2)
++		defer cancelPrimary()
++	}
++	msgCh := r.asyncExchange(primary, r.main, m)
+ 
+ 	if r.fallback == nil { // directly return if no fallback servers are available
+ 		res := <-msgCh
+--- a/config/config.go
++++ b/config/config.go
+@@ -168,6 +168,7 @@
+ 	FakeIPPool6           *fakeip.Pool
+ 	FakeIPSkipper         *fakeip.Skipper
+ 	FakeIPTTL             int
++	FakeIPLookup          bool
+ 	NameServerPolicy      []dns.Policy
+ 	ProxyServerNameserver []dns.NameServer
+ 	ProxyServerPolicy     []dns.Policy
+@@ -238,6 +239,7 @@
+ 	FakeIPFilter                 []string                            `yaml:"fake-ip-filter" json:"fake-ip-filter"`
+ 	FakeIPFilterMode             C.FilterMode                        `yaml:"fake-ip-filter-mode" json:"fake-ip-filter-mode"`
+ 	FakeIPTTL                    int                                 `yaml:"fake-ip-ttl" json:"fake-ip-ttl"`
++	FakeIPLookup                 bool                                `yaml:"fake-ip-lookup" json:"fake-ip-lookup"`
+ 	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
+ 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
+ 	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
+@@ -1420,7 +1422,7 @@
+ 	}
+ 
+ 	if cfg.RespectRules && len(cfg.ProxyServerNameserver) == 0 {
+-		return nil, fmt.Errorf("if “respect-rules” is turned on, “proxy-server-nameserver” cannot be empty")
++		return nil, fmt.Errorf("if вЂњrespect-rulesвЂќ is turned on, вЂњproxy-server-nameserverвЂќ cannot be empty")
+ 	}
+ 
+ 	dnsCfg := &DNS{
+@@ -1539,6 +1541,7 @@
+ 
+ 		dnsCfg.FakeIPSkipper = skipper
+ 		dnsCfg.FakeIPTTL = cfg.FakeIPTTL
++		dnsCfg.FakeIPLookup = cfg.FakeIPLookup
+ 
+ 		if dnsCfg.FakeIPRange.IsValid() {
+ 			pool, err := fakeip.New(fakeip.Options{
+--- a/dns/enhancer.go
++++ b/dns/enhancer.go
+@@ -16,6 +16,7 @@
+ 	fakeIPPool6   *fakeip.Pool
+ 	fakeIPSkipper *fakeip.Skipper
+ 	fakeIPTTL     int
++	fakeIPLookup  bool
+ 	mapping       *lru.LruCache[netip.Addr, string]
+ 	useHosts      bool
+ }
+@@ -165,6 +166,7 @@
+ 	FakeIPPool6   *fakeip.Pool
+ 	FakeIPSkipper *fakeip.Skipper
+ 	FakeIPTTL     int
++	FakeIPLookup  bool
+ 	UseHosts      bool
+ }
+ 
+@@ -182,6 +184,7 @@
+ 		}
+ 		e.fakeIPSkipper = cfg.FakeIPSkipper
+ 		e.fakeIPTTL = cfg.FakeIPTTL
++		e.fakeIPLookup = cfg.FakeIPLookup
+ 		if e.fakeIPTTL < 1 {
+ 			e.fakeIPTTL = 1
+ 		}
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -146,7 +146,7 @@
+ 	}
+ }
+ 
+-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
++func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, lookup bool) middleware {
+ 	return func(next handler) handler {
+ 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+ 			q := r.Question[0]
+@@ -154,6 +154,13 @@
+ 			host := strings.TrimRight(q.Name, ".")
+ 			if skipper.ShouldSkipped(host) {
+ 				return next(ctx, r)
++			}
++
++			if lookup && (q.Qtype == D.TypeA && fakePool != nil || q.Qtype == D.TypeAAAA && fakePool6 != nil) {
++				resolved, err := next(ctx, r)
++				if err != nil || resolved.Rcode != D.RcodeSuccess || len(msgToIP(resolved)) == 0 {
++					return resolved, err
++				}
+ 			}
+ 
+ 			var rr D.RR
+@@ -238,7 +245,7 @@
+ 	}
+ 
+ 	if mapper.mode == C.DNSFakeIP {
+-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
++		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, mapper.fakeIPLookup))
+ 	}
+ 
+ 	if mapper.mode != C.DNSNormal {
