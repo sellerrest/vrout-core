@@ -22,7 +22,7 @@
  func applyRoute(cfg *config.Config) {
 --- a/dns/resolver.go
 +++ b/dns/resolver.go
-@@ -218,6 +218,15 @@
+@@ -214,6 +214,15 @@
  
  		if matched := r.matchPolicy(m); len(matched) != 0 {
  			result, cache, err = batchExchange(ctx, matched, m)
@@ -38,7 +38,7 @@
  			return
  		}
  		result, cache, err = batchExchange(ctx, r.main, m)
-@@ -313,7 +322,13 @@
+@@ -309,7 +318,13 @@
  		return res.Msg, res.Error
  	}
  
@@ -71,7 +71,7 @@
  	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
  	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
  	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
-@@ -1420,7 +1422,7 @@
+@@ -1419,7 +1421,7 @@
  	}
  
  	if cfg.RespectRules && len(cfg.ProxyServerNameserver) == 0 {
@@ -80,7 +80,7 @@
  	}
  
  	dnsCfg := &DNS{
-@@ -1539,6 +1541,7 @@
+@@ -1538,6 +1540,7 @@
  
  		dnsCfg.FakeIPSkipper = skipper
  		dnsCfg.FakeIPTTL = cfg.FakeIPTTL
@@ -148,3 +148,127 @@
  	}
  
  	if mapper.mode != C.DNSNormal {
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -2,7 +2,12 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
++	"math/rand"
++	"net"
++	"strconv"
++	"syscall"
+ 
+ 	"github.com/metacubex/mihomo/component/dialer"
+ 	"github.com/metacubex/mihomo/component/loopback"
+@@ -12,12 +17,16 @@
+ 
+ type Direct struct {
+ 	*Base
+-	loopBack *loopback.Detector
++	loopBack        *loopback.Detector
++	sourcePortFirst uint16
++	sourcePortLast  uint16
+ }
+ 
+ type DirectOption struct {
+ 	BasicOption
+-	Name string `proxy:"name"`
++	Name            string `proxy:"name"`
++	SourcePortFirst uint16 `proxy:"source-port-first,omitempty"`
++	SourcePortLast  uint16 `proxy:"source-port-last,omitempty"`
+ }
+ 
+ // DialContext implements C.ProxyAdapter
+@@ -27,7 +36,14 @@
+ 	}
+ 	opts := d.DialOptions()
+ 	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
+-	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
++	c, err := bindSourcePort(d, func(port int) (net.Conn, error) {
++		if port == 0 {
++			return dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
++		}
++		// Pass a dialer so the platform's interface policy is still applied.
++		scoped := dialer.WithNetDialer(&net.Dialer{LocalAddr: &net.TCPAddr{Port: port}})
++		return dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), append(opts, scoped)...)
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -42,11 +58,37 @@
+ 	if err := d.ResolveUDP(ctx, metadata); err != nil {
+ 		return nil, err
+ 	}
+-	pc, err := dialer.NewDialer(d.DialOptions()...).ListenPacket(ctx, "udp", "", metadata.AddrPort())
++	socket := dialer.NewDialer(d.DialOptions()...)
++	pc, err := bindSourcePort(d, func(port int) (net.PacketConn, error) {
++		address := ""
++		if port != 0 {
++			address = net.JoinHostPort("", strconv.Itoa(port))
++		}
++		return socket.ListenPacket(ctx, "udp", address, metadata.AddrPort())
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	return d.loopBack.NewPacketConn(NewPacketConn(pc, d)), nil
++}
++
++func bindSourcePort[T any](d *Direct, open func(int) (T, error)) (T, error) {
++	if d.sourcePortFirst == 0 {
++		return open(0)
++	}
++	size := int(d.sourcePortLast) - int(d.sourcePortFirst) + 1
++	start := rand.Intn(size)
++	var result T
++	var err error
++	for i := 0; i < size && i < 32; i++ {
++		port := int(d.sourcePortFirst) + (start+i)%size
++		result, err = open(port)
++		if err == nil || !(errors.Is(err, syscall.EADDRINUSE) ||
++			errors.Is(err, syscall.Errno(10048)) || errors.Is(err, syscall.Errno(10013))) {
++			break
++		}
++	}
++	return result, err
+ }
+ 
+ func (d *Direct) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+@@ -77,7 +119,9 @@
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
+ 		}),
+-		loopBack: loopback.NewDetector(),
++		loopBack:        loopback.NewDetector(),
++		sourcePortFirst: option.SourcePortFirst,
++		sourcePortLast:  option.SourcePortLast,
+ 	}
+ }
+ 
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -131,6 +131,11 @@
+ 		if err != nil {
+ 			break
+ 		}
++		if (directOption.SourcePortFirst == 0) != (directOption.SourcePortLast == 0) ||
++			directOption.SourcePortFirst > directOption.SourcePortLast {
++			err = fmt.Errorf("invalid direct source port range")
++			break
++		}
+ 		proxy = outbound.NewDirectWithOption(*directOption)
+ 	case "dns":
+ 		dnsOptions := &outbound.DnsOption{BasicOption: basicOption}
+--- a/main.go
++++ b/main.go
+@@ -116,6 +116,7 @@
+ 	if version {
+ 		fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
+ 			C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)
++		fmt.Println("Capabilities: vrout_zapret")
+ 		if tags := features.Tags(); len(tags) != 0 {
+ 			fmt.Printf("Use tags: %s\n", strings.Join(tags, ", "))
+ 		}
